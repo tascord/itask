@@ -1,33 +1,37 @@
 use std::{
+    collections::VecDeque,
     io::{self, BufRead, BufReader, Stdout},
     process::{Command, Stdio},
     sync::{Arc, RwLock},
-    thread::{self, spawn, Thread},
+    thread::spawn,
     time::Duration,
 };
 
 use anyhow::{bail, Context};
-use menu::main_menu;
+use itertools::Itertools;
 use ratatui::{
     crossterm::{
         event::{self, Event, KeyCode},
         execute,
-        terminal::{
-            self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-        },
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
-    layout::{Constraint, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Rect},
     prelude::CrosstermBackend,
-    style::{Color, Stylize},
-    widgets::{Block, Paragraph, Widget, Wrap},
+    style::Stylize,
+    text::Line,
+    widgets::{Block, Paragraph, WidgetRef, Wrap},
     Frame, Terminal,
 };
-mod menu;
+use ui::{main_menu, Prompt};
+mod ui;
+
+const BANNER: &str = include_str!("../banner");
 
 #[derive(Default)]
 struct Model {
-    job1: RwLock<Option<std::sync::mpsc::Receiver<String>>>,
-    job2: RwLock<Option<std::sync::mpsc::Receiver<String>>>,
+    job1: RwLock<(String, Option<RwLock<VecDeque<String>>>)>,
+    job2: RwLock<(String, Option<RwLock<VecDeque<String>>>)>,
+    prompt: RwLock<Option<Prompt>>,
     menu: RwLock<Option<usize>>,
     quit: RwLock<bool>,
 }
@@ -39,14 +43,25 @@ impl Model {
     // |  Task 2 |  B  |
     // | ------- | --- |
 
-    fn start_j1(self: &Arc<Self>, c: Command) -> anyhow::Result<()> {
-        if self.job1.read().unwrap().is_some() {
-            bail!("Job 1 is already running.")
+    fn start_job(
+        job: RwLock<(String, Option<Arc<RwLock<VecDeque<String>>>>)>,
+        c: Command,
+    ) -> anyhow::Result<()> {
+        if job.read().unwrap().1.is_some() {
+            bail!("Job is already running.")
         }
 
         let mut c = c;
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        self.job1.write().unwrap().replace(rx);
+        let vdq = Arc::new(RwLock::new(VecDeque::new()));
+        job.write().unwrap().1.replace(vdq.clone());
+
+        job.write().unwrap().0 = {
+            let mut title = format!("{c:?}").replace('"', "");
+            if title.len() > 10 {
+                title = format!("{}...", title.split_at(7).0);
+            }
+            title
+        };
 
         spawn(move || {
             let child = c
@@ -60,7 +75,11 @@ impl Model {
             for line in buf.lines() {
                 match line {
                     Ok(l) => {
-                        let _ = tx.send(l);
+                        let mut lock = vdq.write().unwrap();
+                        lock.push_back(l);
+                        while lock.len() > 1000 {
+                            lock.pop_front();
+                        }
                     }
                     Err(e) => {
                         println!("Failed reading output: {:?}", e);
@@ -77,6 +96,17 @@ impl Model {
     fn keys(self: &Arc<Self>) -> anyhow::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                let mut prompt = self.prompt.write().unwrap();
+                if prompt.is_some() {
+                    if key.code == KeyCode::Esc {
+                        *prompt = None;
+                    }
+
+                    prompt.as_mut().inspect(|p| p.input(key.code));
+                    return Ok(());
+                }
+
+                drop(prompt);
                 let mut menu = self.menu.write().unwrap();
                 match key.code {
                     KeyCode::Char('j') => {
@@ -111,7 +141,7 @@ impl Model {
 
                     KeyCode::Enter => {
                         if let Some(idx) = *menu {
-                            menu.replace(main_menu().enter(idx));
+                            menu.replace(main_menu().enter(idx, self.clone()));
                         }
                     }
 
@@ -136,25 +166,113 @@ impl Model {
         })
         .split(frame.area());
 
-        let jobs = Layout::new(
-            ratatui::layout::Direction::Vertical,
-            Constraint::from_percentages([50, 50]),
-        )
-        .split(main[0]);
-
         if let Some(idx) = *self.menu.read().unwrap() {
             let mut idx = idx;
             frame.render_stateful_widget(main_menu(), main[1], &mut idx);
-            frame.render_widget(
-                Paragraph::new(format!("#{idx} :: {:?}", main_menu().0)).wrap(Wrap { trim: true }),
-                jobs[0].inner(Margin::new(1, 1)),
-            );
         }
 
         frame.render_widget(Block::new().hidden(), frame.area());
+        self.render_jobs(main[0], frame);
+        self.render_prompt(frame);
+    }
 
-        frame.render_widget(Block::bordered().title("Job One"), jobs[0]);
-        frame.render_widget(Block::bordered().title("Job Two"), jobs[1]);
+    pub fn render_prompt(self: &Arc<Self>, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        let prompt_area = Rect {
+            x: area.width / 4,
+            y: area.height / 2 - 3,
+            width: area.width / 2,
+            height: 6,
+        };
+
+        if let Some(prompt) = &*self.prompt.read().unwrap() {
+            frame.render_widget(prompt.clone(), prompt_area);
+        }
+    }
+
+    pub fn render_jobs(self: &Arc<Self>, area: Rect, frame: &mut Frame<'_>) {
+        let j1 = self.job1.read().unwrap().1.is_some();
+        let j2 = self.job2.read().unwrap().1.is_some();
+
+        let jobs = Layout::new(
+            ratatui::layout::Direction::Vertical,
+            match (j1, j2) {
+                (false, false) | (false, true) | (true, false) => vec![Constraint::Fill(1)],
+                _ => Constraint::from_percentages([50, 50]),
+            },
+        )
+        .split(area);
+
+        if j1 {
+            let job = self.job1.read().unwrap();
+            let title = job.0.clone();
+            let logs = job.1.as_ref().unwrap().read().unwrap();
+
+            let text = logs
+                .iter()
+                .map(|i| Line::from(i.to_string()))
+                .collect::<Vec<_>>();
+
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(title)),
+                *jobs.first().unwrap(),
+            );
+        }
+
+        if j2 {
+            let job = self.job1.read().unwrap();
+            let title = job.0.clone();
+            let logs = job.1.as_ref().unwrap().read().unwrap();
+
+            let text = logs
+                .iter()
+                .map(|i| Line::from(i.to_string()))
+                .collect::<Vec<_>>();
+
+            frame.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title(title)),
+                *jobs.last().unwrap(),
+            );
+        }
+
+        if !(j1 || j2) {
+            Self::banner(area, frame);
+        }
+    }
+
+    pub fn banner(area: Rect, frame: &mut Frame<'_>) {
+        let (title, help) = BANNER.split("---").collect_tuple().unwrap();
+
+        let lay = Layout::new(
+            Direction::Vertical,
+            vec![
+                Constraint::Fill(1),
+                Constraint::Length(title.lines().count() as u16),
+                Constraint::Length(help.lines().count() as u16),
+                Constraint::Fill(1),
+            ],
+        )
+        .split(area);
+
+        frame.render_widget(Block::bordered(), area);
+        frame.render_widget(
+            Paragraph::new(title.lines().map(|l| Line::from(l)).collect::<Vec<_>>())
+                .alignment(ratatui::layout::Alignment::Center),
+            lay[1],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                help.lines()
+                    .map(|l| Line::from(l.trim()))
+                    .collect::<Vec<_>>(),
+            )
+            .alignment(ratatui::layout::Alignment::Center),
+            lay[2],
+        );
     }
 }
 

@@ -1,11 +1,21 @@
-use std::{fmt::Debug, ops::Add, sync::Arc, vec};
-
-use itertools::Itertools;
-use ratatui::{
-    layout::{Constraint, Layout, Margin},
-    style::{Style, Stylize},
-    widgets::{Block, Paragraph, StatefulWidget, Widget},
+use std::{
+    fmt::Debug,
+    ops::Deref,
+    sync::{Arc, RwLock},
+    vec,
 };
+
+use ratatui::{
+    buffer::Buffer,
+    crossterm::event::KeyCode,
+    layout::{Constraint, Direction, Layout, Margin, Rect},
+    style::{Style, Stylize},
+    widgets::{Block, Clear, Paragraph, StatefulWidget, Widget, WidgetRef},
+};
+
+use crate::Model;
+
+use super::Prompt;
 
 #[derive(Clone)]
 pub enum MenuItem {
@@ -17,7 +27,7 @@ pub enum MenuItem {
 
     Item {
         title: String,
-        handler: Arc<Box<dyn Fn()>>,
+        handler: Arc<Box<dyn Fn(Arc<Model>)>>,
         parent: Option<usize>,
     },
 }
@@ -100,12 +110,14 @@ impl PartialEq for MenuItem {
     }
 }
 
+//
+
 pub struct Menu(pub Vec<MenuItem>);
 impl Menu {
     pub fn with_item(
         &mut self,
         title: &str,
-        handler: impl Fn() + 'static,
+        handler: impl Fn(Arc<Model>) + 'static,
         p: Option<usize>,
     ) -> usize {
         self.0.push(MenuItem::Item {
@@ -175,18 +187,21 @@ impl Menu {
             .unwrap_or(idx)
     }
 
-    pub fn enter(&self, idx: usize) -> usize {
+    pub fn enter(&self, idx: usize, model: Arc<Model>) -> usize {
         match self.0.get(idx).unwrap() {
             MenuItem::Section { children, .. } => children.first().copied().unwrap_or(idx),
             MenuItem::Item { handler, .. } => {
-                handler();
+                handler(model);
                 idx
             }
         }
     }
 
     pub fn back(&self, idx: usize) -> Option<usize> {
-        self.0.get(idx).unwrap().parent()
+        let parent = self.0.get(idx).unwrap().parent();
+        parent
+            .map(|p| self.0.get(p).unwrap().parent().map(|_| p))
+            .flatten()
     }
 
     //
@@ -232,7 +247,8 @@ impl StatefulWidget for Menu {
             .iter()
             .enumerate()
             .filter(|(i, _)| container.items().contains(i))
-            .for_each(|(i, e)| e.clone().render(area[i - 1], buf, &mut (i == *state)));
+            .enumerate()
+            .for_each(|(idx, (i, e))| e.clone().render(area[idx], buf, &mut (i == *state)));
     }
 }
 
@@ -259,14 +275,66 @@ impl StatefulWidget for MenuItem {
     }
 }
 
+macro_rules! menu {
+    // Rule to create a root menu section
+    ($menu:ident, $name:literal => { $($sub:tt)* }) => {
+        let root = $menu.with_section($name, None);
+        menu!(@subsections $menu, root, $($sub)*);
+    };
+
+    // Rule to create a nested menu section within a parent
+    (@subsections $menu:ident, $parent:expr, $name:literal => { $($sub:tt)* } , $($rest:tt)*) => {
+        let section = $menu.with_section($name, Some($parent));
+        menu!(@subsections $menu, section, $($sub)*);
+        menu!(@subsections $menu, $parent, $($rest)*);
+    };
+
+    // Rule to create a single menu item within a section
+    (@subsections $menu:ident, $parent:expr, $name:literal => $action:expr, $($rest:tt)*) => {
+        $menu.with_item($name, $action, Some($parent));
+        menu!(@subsections $menu, $parent, $($rest)*);
+    };
+
+    // End of a section without more subsections
+    (@subsections $menu:ident, $parent:expr, $name:literal => { $($sub:tt)* }) => {
+        let section = $menu.with_section($name, Some($parent));
+        menu!(@subsections $menu, section, $($sub)*);
+    };
+
+    // End of an item without more subsections
+    (@subsections $menu:ident, $parent:expr, $name:literal => $action:expr) => {
+        $menu.with_item($name, $action, Some($parent));
+    };
+
+    // Empty rule to stop recursion
+    (@subsections $menu:ident, $parent:expr,) => {};
+}
+
 pub fn main_menu() -> Menu {
     let mut menu = Menu(vec![]);
 
-    let parent = menu.with_section("Jobs", None);
-    let run = menu.with_section("Run (Server)", Some(parent));
-    menu.with_section("Wasm (Build Frontend)", Some(parent));
-
-    menu.with_item("Sites (bin)", || println!("Booyah"), Some(run));
+    menu! {
+        menu,
+        "Jobs" => {
+            "Run (Server)" => {
+                "Sites (bin)" => |_| {},
+            },
+            "Build Frontend" => {
+                "Sites (wasm)" => |_| {},
+                "Something (wasm+elm)" => |_| {},
+            },
+            "Configure iTask" => {
+                "Set ENV" => |m| {
+                    *m.prompt.write().unwrap() =
+                        Some(Prompt::secret("Enter your Yubikey pin", |_pin| {
+                            return Err("Invalid pin".to_string());
+                        }));
+                },
+            },
+        }
+    };
 
     menu
 }
+
+//
